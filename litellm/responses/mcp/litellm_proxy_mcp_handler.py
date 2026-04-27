@@ -1126,10 +1126,40 @@ class LiteLLM_Proxy_MCP_Handler:
         total_executed = 0
 
         for turn_index in range(max_turns):
+            # [DEBUG-TRACE] temporary: log every turn entry at WARNING so we can
+            # trace why the loop is exiting after one iteration on Railway.
+            _output_types = []
+            try:
+                for _o in current_response.output or []:
+                    if isinstance(_o, dict):
+                        _output_types.append(_o.get("type"))
+                    else:
+                        _output_types.append(getattr(_o, "type", None))
+            except Exception as _e:
+                _output_types = [f"<inspect_err:{_e!r}>"]
+            verbose_logger.warning(
+                "[DBG-TURN] entering turn %s/%s id=%s output_types=%s "
+                "max_tool_calls=%s total_executed=%s",
+                turn_index,
+                max_turns,
+                getattr(current_response, "id", None),
+                _output_types,
+                max_tool_calls,
+                total_executed,
+            )
+
             tool_calls = LiteLLM_Proxy_MCP_Handler._extract_tool_calls_from_response(
                 response=current_response
             )
+            verbose_logger.warning(
+                "[DBG-TURN] turn %s extracted %s tool_calls",
+                turn_index,
+                len(tool_calls),
+            )
             if not tool_calls:
+                verbose_logger.warning(
+                    "[DBG-TURN] turn %s: NO TOOL CALLS, breaking", turn_index
+                )
                 break
 
             if (
@@ -1203,6 +1233,25 @@ class LiteLLM_Proxy_MCP_Handler:
                 all_tools=all_tools,
                 response_id=current_response.id,
                 **follow_up_call_params,
+            )
+
+            # [DEBUG-TRACE] log shape of follow-up response so we can see why
+            # the next turn extracts zero tool_calls.
+            _next_types = []
+            try:
+                for _o in (getattr(next_response, "output", None) or []):
+                    if isinstance(_o, dict):
+                        _next_types.append(_o.get("type"))
+                    else:
+                        _next_types.append(getattr(_o, "type", None))
+            except Exception as _e:
+                _next_types = [f"<inspect_err:{_e!r}>"]
+            verbose_logger.warning(
+                "[DBG-TURN] turn %s follow-up returned type=%s id=%s output_types=%s",
+                turn_index,
+                type(next_response).__name__,
+                getattr(next_response, "id", None),
+                _next_types,
             )
 
             if not isinstance(next_response, ResponsesAPIResponse):
