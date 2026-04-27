@@ -1698,3 +1698,333 @@ async def test_streaming_mcp_event_order_and_response_id_consistency(
     assert not lite_errors, "Unexpected LiteLLM errors: " + ", ".join(
         record.getMessage() for record in lite_errors
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn auto-execute loop (LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop)
+# ---------------------------------------------------------------------------
+
+
+def _make_response(response_id: str, function_calls):
+    """Build a minimal ResponsesAPIResponse with the given function_call items."""
+    output = [
+        {
+            "type": "function_call",
+            "call_id": fc["call_id"],
+            "name": fc["name"],
+            "arguments": fc.get("arguments", "{}"),
+        }
+        for fc in function_calls
+    ]
+    return ResponsesAPIResponse(
+        id=response_id,
+        created_at=0,
+        output=output,
+        model="gpt-4o-mini",
+        object="response",
+    )
+
+
+def _get_call_id(tool_call):
+    """Extract call_id from either a dict or a Pydantic ResponseFunctionToolCall."""
+    if isinstance(tool_call, dict):
+        return tool_call.get("call_id") or tool_call.get("id")
+    return getattr(tool_call, "call_id", None) or getattr(tool_call, "id", None)
+
+
+def _make_text_response(response_id: str, text: str = "all done"):
+    """Build a minimal ResponsesAPIResponse with a plain assistant message."""
+    return ResponsesAPIResponse(
+        id=response_id,
+        created_at=0,
+        output=[
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        ],
+        model="gpt-4o-mini",
+        object="response",
+    )
+
+
+def test_resolve_max_auto_execute_turns_clamps_into_safe_range():
+    """User overrides are clamped: None -> default, <1 -> 1, >ceiling -> ceiling."""
+    from litellm.constants import (
+        DEFAULT_MAX_MCP_AUTO_EXECUTE_TURNS,
+        MAX_MCP_AUTO_EXECUTE_TURNS_CEILING,
+    )
+
+    resolve = LiteLLM_Proxy_MCP_Handler._resolve_max_auto_execute_turns
+
+    assert resolve(None) == DEFAULT_MAX_MCP_AUTO_EXECUTE_TURNS
+    assert resolve(0) == 1
+    assert resolve(-5) == 1
+    assert resolve(3) == 3
+    assert (
+        resolve(MAX_MCP_AUTO_EXECUTE_TURNS_CEILING)
+        == MAX_MCP_AUTO_EXECUTE_TURNS_CEILING
+    )
+    assert (
+        resolve(MAX_MCP_AUTO_EXECUTE_TURNS_CEILING + 100)
+        == MAX_MCP_AUTO_EXECUTE_TURNS_CEILING
+    )
+    # Garbage values fall back to the default rather than crashing.
+    assert resolve("not-a-number") == DEFAULT_MAX_MCP_AUTO_EXECUTE_TURNS  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_run_auto_execute_loop_multi_turn_happy_path():
+    """Model emits tool calls on turn 1 and turn 2, then a text response on turn 3.
+
+    Verifies the loop keeps iterating past the first follow-up - which is the
+    exact regression: previously, only one follow-up call was made and any
+    further function_call items came back unresolved.
+    """
+    initial = _make_response("resp_0", [{"call_id": "c1", "name": "search"}])
+    turn1_response = _make_response("resp_1", [{"call_id": "c2", "name": "fetch"}])
+    final = _make_text_response("resp_2", "search + fetch are done")
+
+    follow_up_responses = [turn1_response, final]
+
+    async def fake_execute_tool_calls(*, tool_calls, **kwargs):
+        return [
+            {
+                "tool_call_id": _get_call_id(tc),
+                "result": f"result-for-{_get_call_id(tc)}",
+            }
+            for tc in tool_calls
+        ]
+
+    async def fake_follow_up(*, follow_up_input, response_id, **kwargs):
+        return follow_up_responses.pop(0)
+
+    with (
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_execute_tool_calls",
+            side_effect=fake_execute_tool_calls,
+        ) as exec_mock,
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_make_follow_up_call",
+            side_effect=fake_follow_up,
+        ) as follow_mock,
+    ):
+        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+            initial_response=initial,
+            original_input="hello",
+            model="gpt-4o-mini",
+            all_tools=[],
+            tool_server_map={"search": "test_server", "fetch": "test_server"},
+            follow_up_call_params={"stream": False},
+            tools=[],
+            user_api_key_auth=MockUserAPIKeyAuth(),
+            secret_fields=None,
+            litellm_call_id="call-1",
+            litellm_trace_id="trace-1",
+            max_turns=10,
+            max_tool_calls=None,
+        )
+
+    assert exec_mock.await_count == 2  # one per round of tool calls
+    assert follow_mock.await_count == 2  # initial -> turn1, turn1 -> final
+    assert result is final
+    assert [r["tool_call_id"] for r in accumulated] == ["c1", "c2"]
+
+
+@pytest.mark.asyncio
+async def test_run_auto_execute_loop_halts_at_max_turns():
+    """A misbehaving model that never stops calling tools must be capped."""
+    initial = _make_response("resp_0", [{"call_id": "c0", "name": "search"}])
+
+    async def fake_execute_tool_calls(*, tool_calls, **kwargs):
+        return [{"tool_call_id": _get_call_id(tc), "result": "ok"} for tc in tool_calls]
+
+    counter = {"n": 0}
+
+    async def fake_follow_up(**kwargs):
+        counter["n"] += 1
+        return _make_response(
+            f"resp_{counter['n']}",
+            [{"call_id": f"c{counter['n']}", "name": "search"}],
+        )
+
+    with (
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_execute_tool_calls",
+            side_effect=fake_execute_tool_calls,
+        ) as exec_mock,
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_make_follow_up_call",
+            side_effect=fake_follow_up,
+        ) as follow_mock,
+    ):
+        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+            initial_response=initial,
+            original_input="hello",
+            model="gpt-4o-mini",
+            all_tools=[],
+            tool_server_map={"search": "test_server"},
+            follow_up_call_params={"stream": False},
+            tools=[],
+            user_api_key_auth=MockUserAPIKeyAuth(),
+            secret_fields=None,
+            litellm_call_id="call-1",
+            litellm_trace_id="trace-1",
+            max_turns=3,
+            max_tool_calls=None,
+        )
+
+    # 3 turns means: extract+execute+follow-up x3 -> exec called 3 times,
+    # follow-up called 3 times, and the final response is whatever the
+    # last follow-up returned (still containing function_calls - left
+    # unresolved for the caller, which is the documented contract).
+    assert exec_mock.await_count == 3
+    assert follow_mock.await_count == 3
+    assert len(accumulated) == 3
+    assert isinstance(result, ResponsesAPIResponse)
+
+    def _output_type(item):
+        if isinstance(item, dict):
+            return item.get("type")
+        return getattr(item, "type", None)
+
+    assert any(_output_type(item) == "function_call" for item in result.output)
+
+
+@pytest.mark.asyncio
+async def test_run_auto_execute_loop_respects_max_tool_calls_budget():
+    """max_tool_calls bounds total tool executions across turns, not just per turn."""
+    initial = _make_response("resp_0", [{"call_id": "c0", "name": "search"}])
+    over_budget = _make_response(
+        "resp_1",
+        [
+            {"call_id": "c1", "name": "search"},
+            {"call_id": "c2", "name": "fetch"},
+        ],
+    )
+
+    async def fake_execute_tool_calls(*, tool_calls, **kwargs):
+        return [{"tool_call_id": _get_call_id(tc), "result": "ok"} for tc in tool_calls]
+
+    async def fake_follow_up(**kwargs):
+        return over_budget
+
+    with (
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_execute_tool_calls",
+            side_effect=fake_execute_tool_calls,
+        ) as exec_mock,
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_make_follow_up_call",
+            side_effect=fake_follow_up,
+        ) as follow_mock,
+    ):
+        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+            initial_response=initial,
+            original_input="hello",
+            model="gpt-4o-mini",
+            all_tools=[],
+            tool_server_map={"search": "test_server", "fetch": "test_server"},
+            follow_up_call_params={"stream": False},
+            tools=[],
+            user_api_key_auth=MockUserAPIKeyAuth(),
+            secret_fields=None,
+            litellm_call_id="call-1",
+            litellm_trace_id="trace-1",
+            max_turns=10,
+            max_tool_calls=2,
+        )
+
+    # Turn 1 executed (1 call), turn 2 was rejected by budget check before
+    # executing -> exec called once, follow-up called once.
+    assert exec_mock.await_count == 1
+    assert follow_mock.await_count == 1
+    assert [r["tool_call_id"] for r in accumulated] == ["c0"]
+    assert result is over_budget
+
+
+@pytest.mark.asyncio
+async def test_run_auto_execute_loop_halts_when_tool_results_empty():
+    """If the tool executor returns no results, the loop must stop, not retry forever."""
+    initial = _make_response("resp_0", [{"call_id": "c0", "name": "search"}])
+
+    async def fake_execute_tool_calls(**kwargs):
+        return []
+
+    follow_mock = AsyncMock()
+
+    with (
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_execute_tool_calls",
+            side_effect=fake_execute_tool_calls,
+        ) as exec_mock,
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_make_follow_up_call",
+            new=follow_mock,
+        ),
+    ):
+        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+            initial_response=initial,
+            original_input="hello",
+            model="gpt-4o-mini",
+            all_tools=[],
+            tool_server_map={"search": "test_server"},
+            follow_up_call_params={"stream": False},
+            tools=[],
+            user_api_key_auth=MockUserAPIKeyAuth(),
+            secret_fields=None,
+            litellm_call_id="call-1",
+            litellm_trace_id="trace-1",
+            max_turns=10,
+            max_tool_calls=None,
+        )
+
+    assert exec_mock.await_count == 1
+    follow_mock.assert_not_called()
+    assert accumulated == []
+    assert result is initial
+
+
+@pytest.mark.asyncio
+async def test_run_auto_execute_loop_returns_initial_when_no_tool_calls():
+    """A model that never asks for tools makes zero follow-up calls."""
+    initial = _make_text_response("resp_0", "no tools needed")
+
+    exec_mock = AsyncMock()
+    follow_mock = AsyncMock()
+
+    with (
+        patch.object(LiteLLM_Proxy_MCP_Handler, "_execute_tool_calls", new=exec_mock),
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler, "_make_follow_up_call", new=follow_mock
+        ),
+    ):
+        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+            initial_response=initial,
+            original_input="hello",
+            model="gpt-4o-mini",
+            all_tools=[],
+            tool_server_map={},
+            follow_up_call_params={"stream": False},
+            tools=[],
+            user_api_key_auth=MockUserAPIKeyAuth(),
+            secret_fields=None,
+            litellm_call_id="call-1",
+            litellm_trace_id="trace-1",
+            max_turns=10,
+            max_tool_calls=None,
+        )
+
+    exec_mock.assert_not_called()
+    follow_mock.assert_not_called()
+    assert accumulated == []
+    assert result is initial

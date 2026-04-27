@@ -110,6 +110,17 @@ MAX_MCP_SEMANTIC_FILTER_TOOLS_HEADER_LENGTH = int(
     os.getenv("MAX_MCP_SEMANTIC_FILTER_TOOLS_HEADER_LENGTH", 150)
 )
 
+# MCP Auto-Execute Loop Safeguards (Responses API multi-turn tool calling)
+# Hard ceiling on the number of tool-call/follow-up cycles for a single
+# /v1/responses request. Prevents runaway agent loops from a misbehaving
+# model. A user-supplied override is still capped at this value.
+DEFAULT_MAX_MCP_AUTO_EXECUTE_TURNS = int(
+    os.getenv("DEFAULT_MAX_MCP_AUTO_EXECUTE_TURNS", 10)
+)
+MAX_MCP_AUTO_EXECUTE_TURNS_CEILING = int(
+    os.getenv("MAX_MCP_AUTO_EXECUTE_TURNS_CEILING", 25)
+)
+
 # Semantic Guard Defaults
 DEFAULT_SEMANTIC_GUARD_EMBEDDING_MODEL = str(
     os.getenv("DEFAULT_SEMANTIC_GUARD_EMBEDDING_MODEL", "text-embedding-3-small")

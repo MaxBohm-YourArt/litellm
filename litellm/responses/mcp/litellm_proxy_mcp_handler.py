@@ -14,7 +14,11 @@ from typing import (
 )
 
 from litellm._logging import verbose_logger
-from litellm.constants import MAXIMUM_TRACEBACK_LINES_TO_LOG
+from litellm.constants import (
+    DEFAULT_MAX_MCP_AUTO_EXECUTE_TURNS,
+    MAX_MCP_AUTO_EXECUTE_TURNS_CEILING,
+    MAXIMUM_TRACEBACK_LINES_TO_LOG,
+)
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._experimental.mcp_server.utils import split_server_prefix_from_name
 from litellm.responses.main import aresponses
@@ -1067,6 +1071,165 @@ class LiteLLM_Proxy_MCP_Handler:
             previous_response_id=response_id,  # Link to previous response
             **call_params,
         )
+
+    @staticmethod
+    def _resolve_max_auto_execute_turns(requested: Optional[int]) -> int:
+        """Clamp a user-supplied turn override into the safe range [1, ceiling].
+
+        Always honors the global ceiling so a misconfigured request can't
+        disable the runaway-loop guardrail.
+        """
+        if requested is None:
+            return DEFAULT_MAX_MCP_AUTO_EXECUTE_TURNS
+        try:
+            value = int(requested)
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_MCP_AUTO_EXECUTE_TURNS
+        if value < 1:
+            return 1
+        return min(value, MAX_MCP_AUTO_EXECUTE_TURNS_CEILING)
+
+    @staticmethod
+    async def _run_auto_execute_loop(
+        *,
+        initial_response: ResponsesAPIResponse,
+        original_input: Any,
+        model: str,
+        all_tools: Optional[List[Any]],
+        tool_server_map: Dict[str, str],
+        follow_up_call_params: Dict[str, Any],
+        tools: Any,
+        user_api_key_auth: Any,
+        secret_fields: Any,
+        litellm_call_id: Any,
+        litellm_trace_id: Any,
+        max_turns: int,
+        max_tool_calls: Optional[int],
+    ) -> Tuple[ResponsesAPIResponse, List[Dict[str, Any]]]:
+        """Drive the MCP tool-execution loop until the model stops calling tools.
+
+        Safeguards:
+          * Hard cap on iterations (``max_turns``, already clamped to the global ceiling).
+          * Optional ``max_tool_calls`` budget across the whole request — if the next
+            batch would exceed it, the loop stops and returns the current response
+            with unresolved ``function_call`` items left in the output.
+          * Empty results from ``_execute_tool_calls`` halt the loop to avoid
+            spinning on a failing tool.
+          * No-tool-calls in a response is the natural exit (the model is done).
+
+        Returns the final response and the accumulated tool results across all turns.
+        """
+        from litellm.responses.utils import ResponsesAPIRequestUtils
+
+        current_response: ResponsesAPIResponse = initial_response
+        accumulated_tool_results: List[Dict[str, Any]] = []
+        total_executed = 0
+
+        for turn_index in range(max_turns):
+            tool_calls = LiteLLM_Proxy_MCP_Handler._extract_tool_calls_from_response(
+                response=current_response
+            )
+            if not tool_calls:
+                break
+
+            if (
+                max_tool_calls is not None
+                and total_executed + len(tool_calls) > max_tool_calls
+            ):
+                verbose_logger.warning(
+                    "MCP auto-execute halted: would exceed max_tool_calls=%s "
+                    "(executed=%s, requested=%s) on turn %s",
+                    max_tool_calls,
+                    total_executed,
+                    len(tool_calls),
+                    turn_index,
+                )
+                break
+
+            (
+                mcp_auth_header,
+                mcp_server_auth_headers,
+                oauth2_headers,
+                raw_headers_from_request,
+            ) = ResponsesAPIRequestUtils.extract_mcp_headers_from_request(
+                secret_fields=secret_fields,
+                tools=tools,
+            )
+
+            tool_results = await LiteLLM_Proxy_MCP_Handler._execute_tool_calls(
+                tool_server_map=tool_server_map,
+                tool_calls=tool_calls,
+                user_api_key_auth=user_api_key_auth,
+                mcp_auth_header=mcp_auth_header,
+                mcp_server_auth_headers=mcp_server_auth_headers,
+                oauth2_headers=oauth2_headers,
+                raw_headers=raw_headers_from_request,
+                litellm_call_id=litellm_call_id,
+                litellm_trace_id=litellm_trace_id,
+            )
+
+            if not tool_results:
+                verbose_logger.warning(
+                    "MCP auto-execute halted: tool execution returned no results "
+                    "on turn %s (tool_calls=%s)",
+                    turn_index,
+                    len(tool_calls),
+                )
+                break
+
+            accumulated_tool_results.extend(tool_results)
+            total_executed += len(tool_calls)
+
+            follow_up_input = LiteLLM_Proxy_MCP_Handler._create_follow_up_input(
+                response=current_response,
+                tool_results=tool_results,
+                # Only seed the original user input on the first turn —
+                # subsequent turns chain via previous_response_id and
+                # appending it again would double-feed the prompt.
+                original_input=original_input if turn_index == 0 else None,
+            )
+
+            verbose_logger.debug(
+                "MCP auto-execute turn %s/%s: executed %s tool call(s) (cumulative=%s)",
+                turn_index + 1,
+                max_turns,
+                len(tool_calls),
+                total_executed,
+            )
+
+            next_response = await LiteLLM_Proxy_MCP_Handler._make_follow_up_call(
+                follow_up_input=follow_up_input,
+                model=model,
+                all_tools=all_tools,
+                response_id=current_response.id,
+                **follow_up_call_params,
+            )
+
+            if not isinstance(next_response, ResponsesAPIResponse):
+                # Streaming is unreachable here in normal paths (the
+                # streaming branch returns earlier in aresponses_api_with_mcp),
+                # but guard defensively so a future caller doesn't silently
+                # loop on an iterator.
+                verbose_logger.warning(
+                    "MCP auto-execute halted: follow-up returned a non-final "
+                    "response type on turn %s",
+                    turn_index,
+                )
+                return next_response, accumulated_tool_results  # type: ignore[return-value]
+
+            current_response = next_response
+        else:
+            # Loop exhausted max_turns without breaking — log so operators
+            # can see runaway-loop suspects in the wild.
+            verbose_logger.warning(
+                "MCP auto-execute hit max_turns=%s; returning last response "
+                "(executed_tool_calls=%s). Remaining function_calls in output "
+                "are left unresolved for the caller.",
+                max_turns,
+                total_executed,
+            )
+
+        return current_response, accumulated_tool_results
 
     @staticmethod
     async def _log_mcp_tool_failure(
