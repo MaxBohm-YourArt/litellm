@@ -1063,13 +1063,25 @@ class LiteLLM_Proxy_MCP_Handler:
         response_id: str,
         **call_params: Any,
     ) -> Union[ResponsesAPIResponse, BaseResponsesAPIStreamingIterator]:
-        """Make follow-up response API call with tool results."""
+        """Make follow-up response API call with tool results.
+
+        Drops the parent request's logging context so each follow-up emits
+        its own spend-log entry. Without this, every turn shares the parent
+        ``litellm_logging_obj`` / ``litellm_call_id`` and only the first turn
+        is recorded in spend logs — producing under-counted budgets for
+        multi-turn MCP runs.
+        """
+        scoped_call_params = {
+            k: v
+            for k, v in call_params.items()
+            if k not in ("litellm_logging_obj", "litellm_call_id")
+        }
         return await aresponses(
             input=follow_up_input,
             model=model,
             tools=all_tools,  # Keep tools for potential future calls
             previous_response_id=response_id,  # Link to previous response
-            **call_params,
+            **scoped_call_params,
         )
 
     @staticmethod
@@ -1105,7 +1117,7 @@ class LiteLLM_Proxy_MCP_Handler:
         litellm_trace_id: Any,
         max_turns: int,
         max_tool_calls: Optional[int],
-    ) -> Tuple[ResponsesAPIResponse, List[Dict[str, Any]]]:
+    ) -> Tuple[ResponsesAPIResponse, List[Dict[str, Any]], List[Any]]:
         """Drive the MCP tool-execution loop until the model stops calling tools.
 
         Safeguards:
@@ -1117,12 +1129,19 @@ class LiteLLM_Proxy_MCP_Handler:
             spinning on a failing tool.
           * No-tool-calls in a response is the natural exit (the model is done).
 
-        Returns the final response and the accumulated tool results across all turns.
+        Returns:
+          (final_response, accumulated_tool_results, prior_turn_output_items)
+
+          ``prior_turn_output_items`` contains every ``output`` item from turns 0
+          through N-1 (the assistant ``message`` reasoning and ``function_call``
+          items). Callers can prepend these to the final response's output so the
+          caller sees the full agent trajectory, not just the last turn.
         """
         from litellm.responses.utils import ResponsesAPIRequestUtils
 
         current_response: ResponsesAPIResponse = initial_response
         accumulated_tool_results: List[Dict[str, Any]] = []
+        prior_turn_output_items: List[Any] = []
         total_executed = 0
 
         for turn_index in range(max_turns):
@@ -1215,7 +1234,17 @@ class LiteLLM_Proxy_MCP_Handler:
                     "response type on turn %s",
                     turn_index,
                 )
-                return next_response, accumulated_tool_results  # type: ignore[return-value]
+                return (  # type: ignore[return-value]
+                    next_response,
+                    accumulated_tool_results,
+                    prior_turn_output_items,
+                )
+
+            # Capture this turn's output items (assistant reasoning +
+            # function_calls) before advancing, so the caller can render the
+            # full agent trajectory rather than only the last turn.
+            if current_response.output:
+                prior_turn_output_items.extend(current_response.output)
 
             current_response = next_response
         else:
@@ -1229,7 +1258,7 @@ class LiteLLM_Proxy_MCP_Handler:
                 total_executed,
             )
 
-        return current_response, accumulated_tool_results
+        return current_response, accumulated_tool_results, prior_turn_output_items
 
     @staticmethod
     async def _log_mcp_tool_failure(

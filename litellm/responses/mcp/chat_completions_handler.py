@@ -701,6 +701,12 @@ async def acompletion_with_mcp(  # noqa: PLR0915
         # only applies to the final response, but since this branch is
         # entered only when stream=False, that's already handled.
         follow_up_call_args["stream"] = False
+        # Drop the parent request's logging context so each follow-up turn
+        # emits its own spend-log entry. Without this, every turn shares
+        # the parent litellm_logging_obj and only the first turn is
+        # recorded — under-counting cost for multi-turn MCP runs.
+        follow_up_call_args.pop("litellm_logging_obj", None)
+        follow_up_call_args.pop("litellm_call_id", None)
 
         next_response = await litellm_acompletion(**follow_up_call_args)
         if not isinstance(next_response, ModelResponse):

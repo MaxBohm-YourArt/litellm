@@ -1812,20 +1812,22 @@ async def test_run_auto_execute_loop_multi_turn_happy_path():
             side_effect=fake_follow_up,
         ) as follow_mock,
     ):
-        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
-            initial_response=initial,
-            original_input="hello",
-            model="gpt-4o-mini",
-            all_tools=[],
-            tool_server_map={"search": "test_server", "fetch": "test_server"},
-            follow_up_call_params={"stream": False},
-            tools=[],
-            user_api_key_auth=MockUserAPIKeyAuth(),
-            secret_fields=None,
-            litellm_call_id="call-1",
-            litellm_trace_id="trace-1",
-            max_turns=10,
-            max_tool_calls=None,
+        result, accumulated, prior_outputs = (
+            await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+                initial_response=initial,
+                original_input="hello",
+                model="gpt-4o-mini",
+                all_tools=[],
+                tool_server_map={"search": "test_server", "fetch": "test_server"},
+                follow_up_call_params={"stream": False},
+                tools=[],
+                user_api_key_auth=MockUserAPIKeyAuth(),
+                secret_fields=None,
+                litellm_call_id="call-1",
+                litellm_trace_id="trace-1",
+                max_turns=10,
+                max_tool_calls=None,
+            )
         )
 
     assert exec_mock.await_count == 2  # one per round of tool calls
@@ -1863,20 +1865,22 @@ async def test_run_auto_execute_loop_halts_at_max_turns():
             side_effect=fake_follow_up,
         ) as follow_mock,
     ):
-        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
-            initial_response=initial,
-            original_input="hello",
-            model="gpt-4o-mini",
-            all_tools=[],
-            tool_server_map={"search": "test_server"},
-            follow_up_call_params={"stream": False},
-            tools=[],
-            user_api_key_auth=MockUserAPIKeyAuth(),
-            secret_fields=None,
-            litellm_call_id="call-1",
-            litellm_trace_id="trace-1",
-            max_turns=3,
-            max_tool_calls=None,
+        result, accumulated, prior_outputs = (
+            await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+                initial_response=initial,
+                original_input="hello",
+                model="gpt-4o-mini",
+                all_tools=[],
+                tool_server_map={"search": "test_server"},
+                follow_up_call_params={"stream": False},
+                tools=[],
+                user_api_key_auth=MockUserAPIKeyAuth(),
+                secret_fields=None,
+                litellm_call_id="call-1",
+                litellm_trace_id="trace-1",
+                max_turns=3,
+                max_tool_calls=None,
+            )
         )
 
     # 3 turns means: extract+execute+follow-up x3 -> exec called 3 times,
@@ -1926,20 +1930,22 @@ async def test_run_auto_execute_loop_respects_max_tool_calls_budget():
             side_effect=fake_follow_up,
         ) as follow_mock,
     ):
-        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
-            initial_response=initial,
-            original_input="hello",
-            model="gpt-4o-mini",
-            all_tools=[],
-            tool_server_map={"search": "test_server", "fetch": "test_server"},
-            follow_up_call_params={"stream": False},
-            tools=[],
-            user_api_key_auth=MockUserAPIKeyAuth(),
-            secret_fields=None,
-            litellm_call_id="call-1",
-            litellm_trace_id="trace-1",
-            max_turns=10,
-            max_tool_calls=2,
+        result, accumulated, prior_outputs = (
+            await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+                initial_response=initial,
+                original_input="hello",
+                model="gpt-4o-mini",
+                all_tools=[],
+                tool_server_map={"search": "test_server", "fetch": "test_server"},
+                follow_up_call_params={"stream": False},
+                tools=[],
+                user_api_key_auth=MockUserAPIKeyAuth(),
+                secret_fields=None,
+                litellm_call_id="call-1",
+                litellm_trace_id="trace-1",
+                max_turns=10,
+                max_tool_calls=2,
+            )
         )
 
     # Turn 1 executed (1 call), turn 2 was rejected by budget check before
@@ -1972,20 +1978,22 @@ async def test_run_auto_execute_loop_halts_when_tool_results_empty():
             new=follow_mock,
         ),
     ):
-        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
-            initial_response=initial,
-            original_input="hello",
-            model="gpt-4o-mini",
-            all_tools=[],
-            tool_server_map={"search": "test_server"},
-            follow_up_call_params={"stream": False},
-            tools=[],
-            user_api_key_auth=MockUserAPIKeyAuth(),
-            secret_fields=None,
-            litellm_call_id="call-1",
-            litellm_trace_id="trace-1",
-            max_turns=10,
-            max_tool_calls=None,
+        result, accumulated, prior_outputs = (
+            await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+                initial_response=initial,
+                original_input="hello",
+                model="gpt-4o-mini",
+                all_tools=[],
+                tool_server_map={"search": "test_server"},
+                follow_up_call_params={"stream": False},
+                tools=[],
+                user_api_key_auth=MockUserAPIKeyAuth(),
+                secret_fields=None,
+                litellm_call_id="call-1",
+                litellm_trace_id="trace-1",
+                max_turns=10,
+                max_tool_calls=None,
+            )
         )
 
     assert exec_mock.await_count == 1
@@ -2008,23 +2016,125 @@ async def test_run_auto_execute_loop_returns_initial_when_no_tool_calls():
             LiteLLM_Proxy_MCP_Handler, "_make_follow_up_call", new=follow_mock
         ),
     ):
-        result, accumulated = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
-            initial_response=initial,
-            original_input="hello",
-            model="gpt-4o-mini",
-            all_tools=[],
-            tool_server_map={},
-            follow_up_call_params={"stream": False},
-            tools=[],
-            user_api_key_auth=MockUserAPIKeyAuth(),
-            secret_fields=None,
-            litellm_call_id="call-1",
-            litellm_trace_id="trace-1",
-            max_turns=10,
-            max_tool_calls=None,
+        result, accumulated, prior_outputs = (
+            await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+                initial_response=initial,
+                original_input="hello",
+                model="gpt-4o-mini",
+                all_tools=[],
+                tool_server_map={},
+                follow_up_call_params={"stream": False},
+                tools=[],
+                user_api_key_auth=MockUserAPIKeyAuth(),
+                secret_fields=None,
+                litellm_call_id="call-1",
+                litellm_trace_id="trace-1",
+                max_turns=10,
+                max_tool_calls=None,
+            )
         )
 
     exec_mock.assert_not_called()
     follow_mock.assert_not_called()
     assert accumulated == []
     assert result is initial
+
+
+@pytest.mark.asyncio
+async def test_run_auto_execute_loop_returns_prior_turn_output_items():
+    """Loop should return every prior turn's output items so callers can render
+    the full agent trajectory, not just the last turn's text."""
+    initial = _make_response("resp_0", [{"call_id": "c1", "name": "search"}])
+    turn1 = _make_response("resp_1", [{"call_id": "c2", "name": "fetch"}])
+    final = _make_text_response("resp_2", "all done")
+
+    follow_up_responses = [turn1, final]
+
+    async def fake_execute_tool_calls(*, tool_calls, **kwargs):
+        return [{"tool_call_id": _get_call_id(tc), "result": "ok"} for tc in tool_calls]
+
+    async def fake_follow_up(**kwargs):
+        return follow_up_responses.pop(0)
+
+    with (
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_execute_tool_calls",
+            side_effect=fake_execute_tool_calls,
+        ),
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_make_follow_up_call",
+            side_effect=fake_follow_up,
+        ),
+    ):
+        result, accumulated, prior_outputs = (
+            await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+                initial_response=initial,
+                original_input="hello",
+                model="gpt-4o-mini",
+                all_tools=[],
+                tool_server_map={"search": "test_server", "fetch": "test_server"},
+                follow_up_call_params={"stream": False},
+                tools=[],
+                user_api_key_auth=MockUserAPIKeyAuth(),
+                secret_fields=None,
+                litellm_call_id="call-1",
+                litellm_trace_id="trace-1",
+                max_turns=10,
+                max_tool_calls=None,
+            )
+        )
+
+    # prior_outputs should contain every turn-N response that was advanced past
+    # (turns 0 and 1), preserving order. The final turn's output stays in
+    # ``result.output`` and is the caller's responsibility to merge.
+    assert len(prior_outputs) == 2  # one item per advanced turn (function_call)
+
+    def _output_type(item):
+        if isinstance(item, dict):
+            return item.get("type")
+        return getattr(item, "type", None)
+
+    assert all(_output_type(item) == "function_call" for item in prior_outputs)
+    assert result is final
+    assert len(accumulated) == 2
+
+
+@pytest.mark.asyncio
+async def test_make_follow_up_call_strips_parent_logging_context():
+    """`_make_follow_up_call` must drop ``litellm_logging_obj`` and
+    ``litellm_call_id`` so each turn emits its own spend-log entry."""
+    captured: dict = {}
+
+    async def fake_aresponses(**kwargs):
+        captured.update(kwargs)
+        return _make_text_response("resp_x")
+
+    with patch(
+        "litellm.responses.mcp.litellm_proxy_mcp_handler.aresponses",
+        side_effect=fake_aresponses,
+    ):
+        await LiteLLM_Proxy_MCP_Handler._make_follow_up_call(
+            follow_up_input=[],
+            model="gpt-4o-mini",
+            all_tools=None,
+            response_id="resp_parent",
+            stream=False,
+            litellm_logging_obj="<parent_logger>",
+            litellm_call_id="parent-call-id",
+            litellm_metadata={"user_api_key_dict": "<keep me>"},
+        )
+
+    assert "litellm_logging_obj" not in captured, (
+        "Follow-up calls must NOT inherit the parent's logging context — "
+        "doing so collapses all turns into one spend-log entry."
+    )
+    assert "litellm_call_id" not in captured, (
+        "Follow-up calls must get a fresh litellm_call_id — sharing causes "
+        "log dedup against the parent request."
+    )
+    # litellm_metadata MUST survive — it carries user_api_key_dict for spend
+    # attribution. Without it, follow-up turns get logged but not charged
+    # to the right user/team.
+    assert captured.get("litellm_metadata") == {"user_api_key_dict": "<keep me>"}
