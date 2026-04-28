@@ -337,7 +337,6 @@ async def aresponses_api_with_mcp(
         (
             final_response,
             accumulated_tool_results,
-            prior_turn_output_items,
         ) = await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
             initial_response=response,
             original_input=input,
@@ -353,16 +352,6 @@ async def aresponses_api_with_mcp(
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
         )
-
-        # Prepend assistant reasoning + function_call items from prior turns
-        # so the caller sees the full agent trajectory in `output`, not just
-        # the last turn's text. Order: turn 0 outputs ... turn N-1 outputs ...
-        # turn N outputs (already in final_response.output), then annotations
-        # appended below.
-        if prior_turn_output_items and isinstance(final_response, ResponsesAPIResponse):
-            final_response.output = list(prior_turn_output_items) + list(
-                final_response.output or []
-            )
 
         if accumulated_tool_results and isinstance(
             final_response, ResponsesAPIResponse

@@ -1085,6 +1085,26 @@ class LiteLLM_Proxy_MCP_Handler:
         )
 
     @staticmethod
+    def _scoped_call_id_for_turn(
+        parent_call_id: Optional[str], turn_index: int
+    ) -> Optional[str]:
+        """Derive a unique-per-turn ``litellm_call_id`` for spend logging.
+
+        Multi-turn MCP runs share one parent request, but each turn's tool
+        executions and follow-up LLM calls must emit their own spend-log
+        rows. Sharing the parent ``litellm_call_id`` causes the MCP logger
+        to dedupe later turns against the first, leaving e.g. turn 1's tool
+        call invisible in the admin-UI request stack. ``litellm_trace_id``
+        stays constant across turns for cross-row correlation.
+
+        Returns ``None`` when there's no parent id; callers downstream will
+        generate their own uuid in that case.
+        """
+        if parent_call_id is None:
+            return None
+        return f"{parent_call_id}-turn-{turn_index}"
+
+    @staticmethod
     def _resolve_max_auto_execute_turns(requested: Optional[int]) -> int:
         """Clamp a user-supplied turn override into the safe range [1, ceiling].
 
@@ -1117,7 +1137,7 @@ class LiteLLM_Proxy_MCP_Handler:
         litellm_trace_id: Any,
         max_turns: int,
         max_tool_calls: Optional[int],
-    ) -> Tuple[ResponsesAPIResponse, List[Dict[str, Any]], List[Any]]:
+    ) -> Tuple[ResponsesAPIResponse, List[Dict[str, Any]]]:
         """Drive the MCP tool-execution loop until the model stops calling tools.
 
         Safeguards:
@@ -1129,19 +1149,15 @@ class LiteLLM_Proxy_MCP_Handler:
             spinning on a failing tool.
           * No-tool-calls in a response is the natural exit (the model is done).
 
-        Returns:
-          (final_response, accumulated_tool_results, prior_turn_output_items)
-
-          ``prior_turn_output_items`` contains every ``output`` item from turns 0
-          through N-1 (the assistant ``message`` reasoning and ``function_call``
-          items). Callers can prepend these to the final response's output so the
-          caller sees the full agent trajectory, not just the last turn.
+        Returns the final response and the accumulated tool results across all turns.
+        Per-turn LLM and MCP calls are individually logged to spend logs (each turn
+        gets a fresh ``litellm_call_id``), so the full trajectory is observable from
+        the admin UI without leaking intermediate items into the client response.
         """
         from litellm.responses.utils import ResponsesAPIRequestUtils
 
         current_response: ResponsesAPIResponse = initial_response
         accumulated_tool_results: List[Dict[str, Any]] = []
-        prior_turn_output_items: List[Any] = []
         total_executed = 0
 
         for turn_index in range(max_turns):
@@ -1175,17 +1191,6 @@ class LiteLLM_Proxy_MCP_Handler:
                 tools=tools,
             )
 
-            # Scope the MCP logging call_id per turn so each turn's tool
-            # executions emit their own MCP log rows. Without this, every
-            # turn shares the parent ``litellm_call_id`` and the MCP logger
-            # dedupes later turns against the first — leaving e.g. turn 1's
-            # SQL query invisible in the admin-UI request stack while turn 0's
-            # ``db_list_entities`` is recorded. ``litellm_trace_id`` stays
-            # constant so cross-turn correlation in tracing is preserved.
-            turn_call_id = (
-                f"{litellm_call_id}-turn-{turn_index}" if litellm_call_id else None
-            )
-
             tool_results = await LiteLLM_Proxy_MCP_Handler._execute_tool_calls(
                 tool_server_map=tool_server_map,
                 tool_calls=tool_calls,
@@ -1194,7 +1199,9 @@ class LiteLLM_Proxy_MCP_Handler:
                 mcp_server_auth_headers=mcp_server_auth_headers,
                 oauth2_headers=oauth2_headers,
                 raw_headers=raw_headers_from_request,
-                litellm_call_id=turn_call_id,
+                litellm_call_id=LiteLLM_Proxy_MCP_Handler._scoped_call_id_for_turn(
+                    litellm_call_id, turn_index
+                ),
                 litellm_trace_id=litellm_trace_id,
             )
 
@@ -1245,17 +1252,7 @@ class LiteLLM_Proxy_MCP_Handler:
                     "response type on turn %s",
                     turn_index,
                 )
-                return (  # type: ignore[return-value]
-                    next_response,
-                    accumulated_tool_results,
-                    prior_turn_output_items,
-                )
-
-            # Capture this turn's output items (assistant reasoning +
-            # function_calls) before advancing, so the caller can render the
-            # full agent trajectory rather than only the last turn.
-            if current_response.output:
-                prior_turn_output_items.extend(current_response.output)
+                return next_response, accumulated_tool_results  # type: ignore[return-value]
 
             current_response = next_response
         else:
@@ -1269,7 +1266,7 @@ class LiteLLM_Proxy_MCP_Handler:
                 total_executed,
             )
 
-        return current_response, accumulated_tool_results, prior_turn_output_items
+        return current_response, accumulated_tool_results
 
     @staticmethod
     async def _log_mcp_tool_failure(

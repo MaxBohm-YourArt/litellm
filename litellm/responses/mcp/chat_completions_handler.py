@@ -656,15 +656,6 @@ async def acompletion_with_mcp(  # noqa: PLR0915
             )
             break
 
-        # Scope MCP call_id per turn so each turn's tool executions emit
-        # their own MCP log rows (the MCP logger dedupes against the
-        # parent litellm_call_id otherwise). litellm_trace_id stays
-        # constant for cross-turn correlation.
-        _parent_call_id = kwargs.get("litellm_call_id")
-        turn_call_id = (
-            f"{_parent_call_id}-turn-{turn_index}" if _parent_call_id else None
-        )
-
         tool_results = await LiteLLM_Proxy_MCP_Handler._execute_tool_calls(
             tool_server_map=tool_server_map,
             tool_calls=tool_calls,
@@ -673,7 +664,9 @@ async def acompletion_with_mcp(  # noqa: PLR0915
             mcp_server_auth_headers=mcp_server_auth_headers,
             oauth2_headers=oauth2_headers,
             raw_headers=raw_headers,
-            litellm_call_id=turn_call_id,
+            litellm_call_id=LiteLLM_Proxy_MCP_Handler._scoped_call_id_for_turn(
+                kwargs.get("litellm_call_id"), turn_index
+            ),
             litellm_trace_id=kwargs.get("litellm_trace_id"),
         )
 
@@ -706,16 +699,14 @@ async def acompletion_with_mcp(  # noqa: PLR0915
         follow_up_call_args = dict(base_call_args)
         follow_up_call_args["messages"] = follow_up_messages
         # Intermediate turns must be non-streaming so we can inspect the
-        # response for further tool calls. The user-facing `stream` flag
-        # only applies to the final response, but since this branch is
-        # entered only when stream=False, that's already handled.
+        # response for further tool calls. (We're already in the
+        # non-streaming branch, so this is a no-op for the user-facing
+        # `stream` flag.)
         follow_up_call_args["stream"] = False
-        # Drop the parent request's logging context so each follow-up turn
-        # emits its own spend-log entry. Without this, every turn shares
-        # the parent litellm_logging_obj and only the first turn is
-        # recorded — under-counting cost for multi-turn MCP runs.
-        follow_up_call_args.pop("litellm_logging_obj", None)
-        follow_up_call_args.pop("litellm_call_id", None)
+        # Drop parent logging context so each turn's call is logged on its
+        # own row. See _make_follow_up_call's docstring for rationale.
+        for key in ("litellm_logging_obj", "litellm_call_id"):
+            follow_up_call_args.pop(key, None)
 
         next_response = await litellm_acompletion(**follow_up_call_args)
         if not isinstance(next_response, ModelResponse):
