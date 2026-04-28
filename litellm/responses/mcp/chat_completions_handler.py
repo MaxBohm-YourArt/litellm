@@ -636,8 +636,39 @@ async def acompletion_with_mcp(  # noqa: PLR0915
     total_executed = 0
 
     for turn_index in range(max_turns):
+        # [DBG-CHAT] temporary: log shape of current_response so we can see
+        # why the loop exits after one iteration on Anthropic chat completions.
+        try:
+            _msg = (
+                current_response.choices[0].message
+                if current_response.choices
+                else None
+            )
+            _tc = getattr(_msg, "tool_calls", None) if _msg else None
+            _content = getattr(_msg, "content", None) if _msg else None
+            _content_type = type(_content).__name__
+            _content_preview = str(_content)[:200] if _content is not None else "<None>"
+            verbose_logger.warning(
+                "[DBG-CHAT] turn %s entry: response.id=%s "
+                "message.tool_calls=%s (count=%s) "
+                "message.content type=%s preview=%r",
+                turn_index,
+                getattr(current_response, "id", None),
+                "PRESENT" if _tc else "EMPTY/NONE",
+                len(_tc) if _tc else 0,
+                _content_type,
+                _content_preview,
+            )
+        except Exception as _e:
+            verbose_logger.warning(
+                "[DBG-CHAT] turn %s inspect error: %r", turn_index, _e
+            )
+
         tool_calls = LiteLLM_Proxy_MCP_Handler._extract_tool_calls_from_chat_response(
             response=current_response
+        )
+        verbose_logger.warning(
+            "[DBG-CHAT] turn %s extracted %s tool_calls", turn_index, len(tool_calls)
         )
         if not tool_calls:
             break
