@@ -8,6 +8,7 @@ from typing import (
     cast,
 )
 
+from litellm._logging import verbose_logger
 from litellm.responses.mcp.litellm_proxy_mcp_handler import (
     LiteLLM_Proxy_MCP_Handler,
 )
@@ -602,69 +603,140 @@ async def acompletion_with_mcp(  # noqa: PLR0915
 
         return cast(CustomStreamWrapper, MCPStreamWrapper(initial_stream, iterator))
 
-    # Non-streaming mode: use existing logic
+    # Non-streaming mode: bounded multi-turn loop.
+    # Same safeguard contract as _run_auto_execute_loop in litellm_proxy_mcp_handler:
+    #   - hard ceiling on iterations (clamped to MAX_MCP_AUTO_EXECUTE_TURNS_CEILING)
+    #   - per-request max_tool_calls budget honored across all turns
+    #   - empty results halt to avoid retry spin
+    #   - no-tool-calls is the natural exit
     initial_call_args = dict(base_call_args)
     initial_call_args["stream"] = False
     if mock_tool_calls is not None:
         initial_call_args["mock_tool_calls"] = mock_tool_calls
 
     # Make initial call
-    initial_response = await litellm_acompletion(**initial_call_args)
+    current_response = await litellm_acompletion(**initial_call_args)
 
-    if not isinstance(initial_response, ModelResponse):
-        return initial_response
+    if not isinstance(current_response, ModelResponse):
+        return current_response
 
-    # Extract tool calls from response
-    tool_calls = LiteLLM_Proxy_MCP_Handler._extract_tool_calls_from_chat_response(
-        response=initial_response
+    max_turns = LiteLLM_Proxy_MCP_Handler._resolve_max_auto_execute_turns(
+        kwargs.get("max_mcp_tool_turns")
     )
-
-    if not tool_calls:
-        _add_mcp_metadata_to_response(
-            response=initial_response,
-            openai_tools=openai_tools,
+    max_tool_calls_raw = kwargs.get("max_tool_calls")
+    try:
+        max_tool_calls = (
+            int(max_tool_calls_raw) if max_tool_calls_raw is not None else None
         )
-        return initial_response
+    except (TypeError, ValueError):
+        max_tool_calls = None
 
-    # Execute tool calls
-    tool_results = await LiteLLM_Proxy_MCP_Handler._execute_tool_calls(
-        tool_server_map=tool_server_map,
-        tool_calls=tool_calls,
-        user_api_key_auth=user_api_key_auth,
-        mcp_auth_header=mcp_auth_header,
-        mcp_server_auth_headers=mcp_server_auth_headers,
-        oauth2_headers=oauth2_headers,
-        raw_headers=raw_headers,
-        litellm_call_id=kwargs.get("litellm_call_id"),
-        litellm_trace_id=kwargs.get("litellm_trace_id"),
-    )
+    accumulated_tool_calls: List[Any] = []
+    accumulated_tool_results: List[Any] = []
+    total_executed = 0
 
-    if not tool_results:
-        _add_mcp_metadata_to_response(
-            response=initial_response,
-            openai_tools=openai_tools,
+    for turn_index in range(max_turns):
+        tool_calls = LiteLLM_Proxy_MCP_Handler._extract_tool_calls_from_chat_response(
+            response=current_response
+        )
+        if not tool_calls:
+            break
+
+        if (
+            max_tool_calls is not None
+            and total_executed + len(tool_calls) > max_tool_calls
+        ):
+            verbose_logger.warning(
+                "MCP auto-execute halted (chat): would exceed max_tool_calls=%s "
+                "(executed=%s, requested=%s) on turn %s",
+                max_tool_calls,
+                total_executed,
+                len(tool_calls),
+                turn_index,
+            )
+            break
+
+        tool_results = await LiteLLM_Proxy_MCP_Handler._execute_tool_calls(
+            tool_server_map=tool_server_map,
             tool_calls=tool_calls,
+            user_api_key_auth=user_api_key_auth,
+            mcp_auth_header=mcp_auth_header,
+            mcp_server_auth_headers=mcp_server_auth_headers,
+            oauth2_headers=oauth2_headers,
+            raw_headers=raw_headers,
+            litellm_call_id=kwargs.get("litellm_call_id"),
+            litellm_trace_id=kwargs.get("litellm_trace_id"),
         )
-        return initial_response
 
-    # Create follow-up messages with tool results
-    follow_up_messages = LiteLLM_Proxy_MCP_Handler._create_follow_up_messages_for_chat(
-        original_messages=messages,
-        response=initial_response,
-        tool_results=tool_results,
-    )
+        if not tool_results:
+            verbose_logger.warning(
+                "MCP auto-execute halted (chat): tool execution returned no "
+                "results on turn %s (tool_calls=%s)",
+                turn_index,
+                len(tool_calls),
+            )
+            break
 
-    # Make follow-up call with original stream setting
-    follow_up_call_args = dict(base_call_args)
-    follow_up_call_args["messages"] = follow_up_messages
-    follow_up_call_args["stream"] = stream
+        accumulated_tool_calls.extend(tool_calls)
+        accumulated_tool_results.extend(tool_results)
+        total_executed += len(tool_calls)
 
-    response = await litellm_acompletion(**follow_up_call_args)
-    if isinstance(response, (ModelResponse, CustomStreamWrapper)):
+        follow_up_messages = (
+            LiteLLM_Proxy_MCP_Handler._create_follow_up_messages_for_chat(
+                original_messages=messages,
+                response=current_response,
+                tool_results=tool_results,
+            )
+        )
+        # Subsequent turns chain via the growing follow_up_messages list. The
+        # helper above already includes the original user messages + the
+        # assistant tool-call turn + the tool-result message, so we use that
+        # as the new "messages" baseline for the next iteration.
+        messages = follow_up_messages
+
+        follow_up_call_args = dict(base_call_args)
+        follow_up_call_args["messages"] = follow_up_messages
+        # Intermediate turns must be non-streaming so we can inspect the
+        # response for further tool calls. The user-facing `stream` flag
+        # only applies to the final response, but since this branch is
+        # entered only when stream=False, that's already handled.
+        follow_up_call_args["stream"] = False
+
+        next_response = await litellm_acompletion(**follow_up_call_args)
+        if not isinstance(next_response, ModelResponse):
+            # Defensive: a non-final response type from a non-streaming call
+            # is unexpected; bail with what we have so the caller sees the
+            # accumulated tool execution rather than a silent failure.
+            verbose_logger.warning(
+                "MCP auto-execute halted (chat): follow-up returned a non-final "
+                "response type on turn %s",
+                turn_index,
+            )
+            return next_response
+
+        current_response = next_response
+    else:
+        # Loop exhausted max_turns without breaking — log so operators can
+        # spot runaway-loop suspects.
+        verbose_logger.warning(
+            "MCP auto-execute hit max_turns=%s (chat); returning last response "
+            "(executed_tool_calls=%s). Remaining tool_calls in the message are "
+            "left unresolved for the caller.",
+            max_turns,
+            total_executed,
+        )
+
+    if accumulated_tool_results:
         _add_mcp_metadata_to_response(
-            response=response,
+            response=current_response,
             openai_tools=openai_tools,
-            tool_calls=tool_calls,
-            tool_results=tool_results,
+            tool_calls=accumulated_tool_calls,
+            tool_results=accumulated_tool_results,
         )
-    return response
+    else:
+        _add_mcp_metadata_to_response(
+            response=current_response,
+            openai_tools=openai_tools,
+        )
+
+    return current_response
