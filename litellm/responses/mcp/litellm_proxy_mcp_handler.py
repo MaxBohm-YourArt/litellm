@@ -1175,6 +1175,17 @@ class LiteLLM_Proxy_MCP_Handler:
                 tools=tools,
             )
 
+            # Scope the MCP logging call_id per turn so each turn's tool
+            # executions emit their own MCP log rows. Without this, every
+            # turn shares the parent ``litellm_call_id`` and the MCP logger
+            # dedupes later turns against the first — leaving e.g. turn 1's
+            # SQL query invisible in the admin-UI request stack while turn 0's
+            # ``db_list_entities`` is recorded. ``litellm_trace_id`` stays
+            # constant so cross-turn correlation in tracing is preserved.
+            turn_call_id = (
+                f"{litellm_call_id}-turn-{turn_index}" if litellm_call_id else None
+            )
+
             tool_results = await LiteLLM_Proxy_MCP_Handler._execute_tool_calls(
                 tool_server_map=tool_server_map,
                 tool_calls=tool_calls,
@@ -1183,7 +1194,7 @@ class LiteLLM_Proxy_MCP_Handler:
                 mcp_server_auth_headers=mcp_server_auth_headers,
                 oauth2_headers=oauth2_headers,
                 raw_headers=raw_headers_from_request,
-                litellm_call_id=litellm_call_id,
+                litellm_call_id=turn_call_id,
                 litellm_trace_id=litellm_trace_id,
             )
 

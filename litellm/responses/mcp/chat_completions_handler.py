@@ -656,6 +656,15 @@ async def acompletion_with_mcp(  # noqa: PLR0915
             )
             break
 
+        # Scope MCP call_id per turn so each turn's tool executions emit
+        # their own MCP log rows (the MCP logger dedupes against the
+        # parent litellm_call_id otherwise). litellm_trace_id stays
+        # constant for cross-turn correlation.
+        _parent_call_id = kwargs.get("litellm_call_id")
+        turn_call_id = (
+            f"{_parent_call_id}-turn-{turn_index}" if _parent_call_id else None
+        )
+
         tool_results = await LiteLLM_Proxy_MCP_Handler._execute_tool_calls(
             tool_server_map=tool_server_map,
             tool_calls=tool_calls,
@@ -664,7 +673,7 @@ async def acompletion_with_mcp(  # noqa: PLR0915
             mcp_server_auth_headers=mcp_server_auth_headers,
             oauth2_headers=oauth2_headers,
             raw_headers=raw_headers,
-            litellm_call_id=kwargs.get("litellm_call_id"),
+            litellm_call_id=turn_call_id,
             litellm_trace_id=kwargs.get("litellm_trace_id"),
         )
 

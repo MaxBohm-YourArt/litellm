@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 import pytest
-from typing import List, Any, cast
+from typing import List, Any, Optional, cast
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.abspath("../../.."))
@@ -2138,3 +2138,61 @@ async def test_make_follow_up_call_strips_parent_logging_context():
     # attribution. Without it, follow-up turns get logged but not charged
     # to the right user/team.
     assert captured.get("litellm_metadata") == {"user_api_key_dict": "<keep me>"}
+
+
+@pytest.mark.asyncio
+async def test_run_auto_execute_loop_scopes_mcp_call_id_per_turn():
+    """Each turn's `_execute_tool_calls` must receive a UNIQUE `litellm_call_id`,
+    derived from the parent's. Sharing the parent's id causes the MCP logger
+    to dedupe later turns' tool executions against the first turn's, leaving
+    e.g. turn 1's SQL query missing from the admin-UI MCP request stack."""
+    initial = _make_response("resp_0", [{"call_id": "c1", "name": "search"}])
+    turn1 = _make_response("resp_1", [{"call_id": "c2", "name": "fetch"}])
+    final = _make_text_response("resp_2", "done")
+
+    follow_up_responses = [turn1, final]
+    seen_call_ids: List[Optional[str]] = []
+
+    async def fake_execute_tool_calls(*, tool_calls, litellm_call_id, **kwargs):
+        seen_call_ids.append(litellm_call_id)
+        return [{"tool_call_id": _get_call_id(tc), "result": "ok"} for tc in tool_calls]
+
+    async def fake_follow_up(**kwargs):
+        return follow_up_responses.pop(0)
+
+    with (
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_execute_tool_calls",
+            side_effect=fake_execute_tool_calls,
+        ),
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "_make_follow_up_call",
+            side_effect=fake_follow_up,
+        ),
+    ):
+        await LiteLLM_Proxy_MCP_Handler._run_auto_execute_loop(
+            initial_response=initial,
+            original_input="hello",
+            model="gpt-4o-mini",
+            all_tools=[],
+            tool_server_map={"search": "test_server", "fetch": "test_server"},
+            follow_up_call_params={"stream": False},
+            tools=[],
+            user_api_key_auth=MockUserAPIKeyAuth(),
+            secret_fields=None,
+            litellm_call_id="parent-call-id",
+            litellm_trace_id="trace-1",
+            max_turns=10,
+            max_tool_calls=None,
+        )
+
+    # Two turns of tool execution → two distinct call_ids derived from parent.
+    assert len(seen_call_ids) == 2
+    assert seen_call_ids[0] != seen_call_ids[1], (
+        "MCP call_id must be scoped per turn so the MCP logger doesn't "
+        "dedupe later turns against the first."
+    )
+    # Both should still encode the parent for traceability in spend logs.
+    assert all("parent-call-id" in (cid or "") for cid in seen_call_ids)
