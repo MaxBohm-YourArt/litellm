@@ -1126,8 +1126,37 @@ class LiteLLM_Proxy_MCP_Handler:
         total_executed = 0
 
         for turn_index in range(max_turns):
+            # [DBG-RESP] temporary: log shape of current_response so we can
+            # see why the responses-loop exits after one iteration.
+            try:
+                _output = getattr(current_response, "output", None) or []
+                _types = []
+                for _o in _output:
+                    if isinstance(_o, dict):
+                        _types.append(_o.get("type"))
+                    else:
+                        _types.append(getattr(_o, "type", None))
+                verbose_logger.warning(
+                    "[DBG-RESP] turn %s entry: response.id=%s output_count=%s "
+                    "output_types=%s response_type=%s",
+                    turn_index,
+                    getattr(current_response, "id", None),
+                    len(_output),
+                    _types,
+                    type(current_response).__name__,
+                )
+            except Exception as _e:
+                verbose_logger.warning(
+                    "[DBG-RESP] turn %s inspect error: %r", turn_index, _e
+                )
+
             tool_calls = LiteLLM_Proxy_MCP_Handler._extract_tool_calls_from_response(
                 response=current_response
+            )
+            verbose_logger.warning(
+                "[DBG-RESP] turn %s extracted %s tool_calls",
+                turn_index,
+                len(tool_calls),
             )
             if not tool_calls:
                 break
